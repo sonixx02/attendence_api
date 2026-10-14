@@ -1,41 +1,93 @@
-# REVIEW.md
 
-List every defect you found in the starter `app/main.py` (helpers and endpoints). For each one:
 
-| # | Where (function / line) | What is wrong | How you'd notice it (test, input, or symptom) | How you fixed it |
+The starter covered only the happy path.
+The main problems were validation, time handling, pagination, concurrency, and
+the missing endpoints.
+
+## Defects found in the starter
+
+| # | Where | What was wrong | How I noticed it | How I fixed it |
 |---|---|---|---|---|
-| 1 | `compute_late_minutes` (lines 33–37) | Boundary defect on grace cutoff. Truncates elapsed seconds to integer minutes before comparison. For 10 min 1 sec late (`09:40:01`), `int(601 / 60) = 10`, and `10 > 10` evaluates to `False`, returning `0` instead of `10`. | Input punch-in at `09:40:01` for shift `09:30:00`. Expected `10` minutes late (Rule R2), but got `0`. | Compare raw elapsed seconds strictly against 600 seconds (`diff_seconds > 600`), then apply floor division (`int(diff_seconds // 60)`). |
-| 2 | `compute_late_minutes` (line 35) | Overnight shift inversion. Uses `punch_in.replace(hour=h, minute=m)`. For a 22:00–06:00 shift with punch-in at 01:00 next day, `start` is placed at 22:00 *today* (in the future), yielding negative time and returning 0 late minutes. | Employee with shift `22:00–06:00` punches in at `01:00` on the next calendar day. Expected `180` minutes late, but got `0`. | Determine the true attendance date first (Rule R1) and build `shift_start_ist` using the actual shift start date in IST. |
-| 3 | `compute_work_hours` (line 41) | Python's built-in `round()` uses Banker's rounding (round half to even). Fractional work hours ending in `.005` (e.g., 4.495 hours) can round down to `4.49` instead of `4.50`, wrongfully triggering a half day. | Input punch difference of 16,182 seconds ($4.495$ hours). Expected `4.50` hours (Rule R4), but got `4.49`. | Implement half-up rounding using Python's `decimal.Decimal` with `ROUND_HALF_UP`. |
-| 4 | `compute_overtime` (lines 44–47) | Missing 30-minute threshold. Returns any elapsed minutes past `shift_end`, completely ignoring the Rule R3 requirement that overtime only counts if $\ge 30$ minutes. | Punch out at 18:35 for an 18:30 shift end. Expected `0` overtime minutes (Rule R3, Sample 1), but got `5`. | Only return elapsed floor minutes if `diff_minutes >= 30`; otherwise return `0`. |
-| 5 | `compute_overtime` (line 46) | Overnight shift date mismatch. Constructs `end` on `date_str` directly. On an overnight shift (e.g. 22:00–06:00 on July 6), `shift_end` is at 06:00 on July 7 (`date_str + 1 day`). Comparing against July 6 06:00 gives ~24 hours of fake overtime. | Employee punches out at `06:35` on an overnight shift. Expected `35` minutes overtime, but got `1475` minutes. | Detect if `shift_end <= shift_start`. If overnight, add 1 day to the calendar date when constructing `shift_end_ist`. |
-| 6 | `compute_overtime` (lines 46–47) | Offset-naive vs offset-aware datetime subtraction crash. Line 46 sets `tzinfo=IST` on `end`, while `punch_out` from PyMongo or `now()` is naive, causing an unhandled `TypeError`. | Calling punch-out throws `TypeError: can't subtract offset-naive and offset-aware datetimes`, resulting in HTTP 500. | Normalize all instants to timezone-aware IST datetimes before computing time deltas. |
-| 7 | `health` (lines 72–74) | Fake readiness probe. Always returns `{"status": "ok"}` with HTTP 200 without checking if MongoDB is alive, violating the environment contract. | Stop MongoDB service and call `GET /health`. Returns HTTP 200 instead of HTTP 503. | Execute `client.admin.command('ping')` inside a try-except block; return HTTP 503 if ping fails or times out. |
-| 8 | Application Startup (Global) | Missing startup index creation. The environment contract requires all indexes to be created idempotently at startup before handling traffic. | Inspect `db.employees.index_information()` at startup; only default `_id_` index exists. Concurrent requests fail race tests. | Add a FastAPI `lifespan` handler that creates unique indexes on `employees.emp_code` and `attendance_logs.(emp_code, date)` and query indexes at startup. |
-| 9 | `create_employee` (lines 79–83) | Concurrency race condition on employee creation. Checks `find_one()` then calls `insert_one()`. Parallel identical requests both pass the check and insert duplicates. | Send two concurrent `POST /employees` requests with identical `emp_code`. Both return HTTP 201 and duplicate docs exist in Mongo. | Enforce database unique index on `emp_code`. Catch PyMongo's `DuplicateKeyError` and raise `HTTPException(409, "emp_code already exists")`. |
-| 10 | `create_employee` (lines 53–61) | Missing validation that `shift_start != shift_end`. Allows creating employees where start equals end, violating the API contract. | Send `POST /employees` with `shift_start: "09:00", shift_end: "09:00"`. Returns HTTP 201 instead of HTTP 422. | Add Pydantic model validator verifying that `shift_start != shift_end` and raise validation error (HTTP 422). |
-| 11 | `list_employees` (line 93) | Off-by-one pagination skip bug. Calculates `skip = page * page_size`. When `page = 1`, it skips 20 records and serves items 21–40 on page 1. | Call `GET /employees?page=1&page_size=20`. First 20 employees are missing from response items. | Change formula to `skip = (page - 1) * page_size`. |
-| 12 | `list_employees` (line 94) | `total` ignores query filter. Calls `count_documents({})` with an empty filter, reporting the whole collection count instead of the filtered count. | Call `GET /employees?department=Engineering` where only 5 of 100 employees belong to Engineering. `total` returns 100 instead of 5. | Pass the query filter: `total = db.employees.count_documents(q)`. |
-| 13 | `list_employees` (line 95) | Missing sort order. Contract states: *"Sorted by `emp_code` ascending"*. Starter does not sort, leading to non-deterministic pagination. | Query `GET /employees`. Order is not guaranteed to be ascending by `emp_code`. | Add `.sort("emp_code", 1)` to the MongoDB query. |
-| 14 | `punch_in` (lines 102–103) | Uses local server time and ignores overnight shift attendance date. If the server is in UTC, `fromtimestamp` produces naive UTC dates. Fails to assign punch-ins before `shift_end` on overnight shifts to the previous calendar day. | Overnight worker punches in at 02:00 AM on July 7 for a 22:00–06:00 shift. Starter assigns `date: "2026-07-07"` instead of `"2026-07-06"`. | Convert timestamp to IST, inspect if `shift_end <= shift_start` and punch time $< \text{shift\_end}$; adjust date to previous day if so. |
-| 15 | `punch_in` (lines 104–118) | Concurrency race condition on punch-in. Two simultaneous punch-ins for the same employee and date both pass `find_one()` check and create duplicate logs. | Send concurrent punch-ins for same employee on same date. Both return HTTP 201. | Enforce compound unique index on `(emp_code, date)` and catch `DuplicateKeyError` to return HTTP 409. |
-| 16 | `punch_in` (lines 119–120) | Leaks internal ID and returns incorrect timestamp types. Sets `doc["id"] = str(res.inserted_id)`. Also returns Python `datetime` objects instead of epoch milliseconds. | Validate response schema against OpenAPI. Extra `id` field present and `punch_in` is ISO string instead of integer epoch ms. | Strip internal `_id`, do not add `id`, and convert all instants to integer epoch milliseconds. |
-| 17 | `list_attendance` (lines 144–146) | In-memory fetch of entire dataset. Calls `list(db.attendance_logs.find(q))` and sorts in Python. Fails with high latency/OOM on 100,000 records. | Run `GET /attendance` with 100,000 documents; executes full collection in-memory scan rather than indexed database query. | Apply `.sort([("date", -1), ("emp_code", 1)]).skip(skip).limit(page_size)` directly in MongoDB query. |
-| 18 | `PunchInIn` / Timestamps (lines 63–67) | Missing validation on epoch milliseconds. Contract requires integer milliseconds ($\ge 10^{11}$). Values in seconds (e.g. `1719811200`) or floats are accepted, converting to year 1970. | Send `{"emp_code": "EMP0001", "punched_at": 1719811200}`. Accepted with HTTP 201 with 1970 date instead of HTTP 422. | Add Pydantic validator asserting integer and `punched_at >= 100_000_000_000`, rejecting violations with HTTP 422. |
-| 19 | `punch_in` (line 102) | Unknown employees are not handled. `emp` can be `None`, then `emp["shift_start"]` raises an exception instead of returning the required 404. | Punch in with an `emp_code` that is not in `employees`; the endpoint can return 500. | Check the employee lookup and return 404 before calculating derived fields. |
-| 20 | `PunchInIn.status` (line 66) | Any string is accepted even though punch-in only permits `PRESENT`, `WFH` and `ON_DUTY`. | Send `status: "VACATION"`; the starter writes an invalid attendance document instead of returning 422. | Use an enum/literal constrained to the three presence statuses. |
-| 21 | `EmployeeIn` and date query parameters | Shift times and calendar dates are plain strings with no format validation. Invalid values reach date/time calculations and can produce inconsistent errors. | Send `shift_start: "25:90"` or `joined_on: "not-a-date"`. | Validate `HH:MM` and `YYYY-MM-DD` at the request boundary. |
-| 22 | Pagination parameters | `page` and `page_size` accept zero, negative values, and page sizes above the contract maximum of 100. | Request `?page=0&page_size=1000`; the starter silently returns an invalid page. | Use bounded FastAPI query validation (`page >= 1`, `1 <= page_size <= 100`). |
-| 23 | `created_at` and all response serializers | The starter writes naive server time and exposes BSON/Python datetimes directly. The API requires UTC epoch milliseconds for every instant. | Inspect an employee or attendance response; timestamps are ISO strings instead of integer milliseconds. | Store UTC instants, truncate where required, and serialize all instants through one epoch-millisecond helper. |
+| 1 | `compute_late_minutes` | It converted elapsed seconds to minutes before checking the 10-minute grace boundary. | `09:40:01` was treated as not late, but R2 requires 10 late minutes. | Compare seconds to 600 first, then floor the minutes. |
+| 2 | `compute_late_minutes` | It built the shift start on the punch-in calendar date, which is wrong for an overnight shift. | A `22:00-06:00` employee punching in at `01:00` got a future shift start. | Resolve the attendance date first and build the shift start in IST. |
+| 3 | `compute_work_hours` | Python `round()` uses banker’s rounding. | A half-way value such as `4.495` hours can round to `4.49`. | Use `Decimal` with `ROUND_HALF_UP`. |
+| 4 | `compute_overtime` | It counted overtime even when it was less than 30 minutes. | An `18:35` punch-out for an `18:30` shift returned 5 overtime minutes. | Return overtime only when the elapsed time is at least 30 minutes. |
+| 5 | `compute_overtime` | It put an overnight shift end on the wrong calendar day. | A `22:00-06:00` shift produced almost a full day of false overtime. | Add one day to the shift end for overnight shifts. |
+| 6 | Time handling | The starter used local, sometimes naive datetimes. | The API could calculate a different date depending on the server timezone, and aware/naive subtraction could fail. | Convert instants to UTC-aware datetimes and calendar values to IST. |
+| 7 | `health` | It always returned 200 without checking MongoDB. | Stopping MongoDB would still produce `{"status": "ok"}`. | Ping MongoDB and return 503 when it is unavailable. |
+| 8 | `EmployeeIn` | It did not validate employee fields, dates, shift times, or equal shifts. | Invalid dates, times, and `shift_start == shift_end` were accepted. | Added Pydantic field validation and a model validator. |
+| 9 | `create_employee` | The `find_one()` then `insert_one()` check was not race-safe. | Two identical requests could both pass the check. | Added a unique database index and handled `DuplicateKeyError` as 409. |
+| 10 | `create_employee` | It stored and returned the server datetime in the wrong API format. | The contract requires epoch milliseconds and truncated seconds. | Store UTC datetimes internally and convert them at the API boundary. |
+| 11 | `list_employees` | Page 1 skipped the first page of records. | `skip = page * page_size` starts page 1 at record 21. | Use `(page - 1) * page_size`. |
+| 12 | `list_employees` | `total` ignored the department filter. | A filtered request reported the whole collection count. | Count using the same query as the listing. |
+| 13 | `list_employees` | It did not guarantee `emp_code` ascending order. | Pagination could change order between requests. | Sort in MongoDB by `emp_code`. |
+| 14 | `list_employees` | Page and page-size limits were not validated. | Zero, negative, or oversized values were accepted. | Added FastAPI query constraints. |
+| 15 | `punch_in` | It did not handle an unknown employee before accessing shift data. | An unknown employee could cause a server error instead of 404. | Return 404 before using employee fields. |
+| 16 | `punch_in` | It accepted seconds, floats, strings, and invalid epoch values. | A seconds timestamp could be interpreted as a 1970 date. | Added strict epoch-millisecond validation. |
+| 17 | `punch_in` | It calculated the date using server-local time and ignored overnight rules. | Overnight punches before shift end were assigned to the wrong day. | Use IST and `_attendance_date()`. |
+| 18 | `punch_in` | The pre-insert duplicate check was not concurrency-safe. | Parallel punch-ins could both return 201. | Added a unique `(emp_code, date)` index and handled duplicate inserts. |
+| 19 | `punch_in` | It returned an internal `id` field. | `_id` and a derived `id` are not part of the contract. | Return only contract fields through `_record()`. |
+| 20 | `list_attendance` | It loaded and sorted the entire collection in Python. | This is slow and memory-heavy at the required 100,000 records. | Apply filter, sort, skip, and limit in MongoDB. |
+| 21 | `list_attendance` | It calculated `total` after loading all matching documents. | It did not use a database count and was not scalable. | Use `count_documents(query)`. |
+| 22 | `list_attendance` | It returned MongoDB `_id` indirectly as `id` and returned datetimes directly. | The response did not match the API schema. | Use `_record()` and epoch-millisecond conversion. |
+| 23 | `list_attendance` | It did not validate dates, status values, or the date range. | Bad filters could be accepted instead of returning 422. | Added date parsing, enum constraints, and range validation. |
+| 24 | Starter file | Six required endpoint groups were only TODOs. | Punch-out, regularization, analytics, and explain were missing. | Implemented the endpoints with MongoDB aggregation pipelines. |
 
----
+## Additional issues found while testing the completed code
 
-### Items Examined and Determined NOT to be Defects:
-1. **`IST = timezone(timedelta(hours=5, minutes=30))` (Line 25):** 
-   Examined whether standard `timedelta(hours=5, minutes=30)` accurately represents IST without daylight saving anomalies. In India, IST is fixed at UTC+05:30 year-round with no DST transitions, making this definition exact and correct.
-2. **`doc.pop("_id", None)` (Line 84):** 
-   Examined whether stripping `_id` before returning employee documents is correct. The specification strictly specifies that MongoDB internal `_id` must never be exposed through the API, so removing `_id` is correct.
-3. **Pydantic Model Dump `body.model_dump()` (Line 81):** 
-   Verified compatibility with Pydantic v2. `model_dump()` is the standard Pydantic v2 method (replacing `dict()` from v1), matching the `pydantic>=2.6` dependency in `requirements.txt`.
-4. **Collections Structure:** 
-   Verified that using two separate collections (`employees` and `attendance_logs`) matches `DATA_MODEL.md` requirements and the grader's seed script expectations.
+The review tests also found two issues in the first completed version:
+
+1. MongoDB explain output contains BSON `Timestamp` values. Returning it
+   directly caused HTTP 500. I converted the result to JSON-safe Extended
+   JSON before returning it.
+2. The trend pipeline begins with `$documents`. MongoDB requires the explain
+   command to use the special `aggregate: 1` namespace for this pipeline. The
+   trend explain branch now uses MongoDB's supported aggregate-explain form.
+
+## Tests and evidence
+
+The tests are in [tests/test_api.py](tests/test_api.py). They use the
+configured MongoDB through the FastAPI application. Test-created records are
+removed during teardown.
+
+The suite covers:
+
+* employee CRUD, filtering, pagination, and duplicate creation;
+* timestamp and shift validation;
+* the R2 late boundary and R3-R5 punch-out rules;
+* an overnight shift;
+* regularization history and legacy missing fields;
+* no-log employees and mid-month working days;
+* weekend and missing-day trend rows;
+* leaderboard ties at the cutoff;
+* concurrent punch-in and punch-out;
+* all five explain targets and index plans.
+
+Command:
+
+```text
+python -m unittest discover -s tests -v
+```
+
+Final result:
+
+```text
+Ran 12 tests in 3.137s
+OK
+```
+
+The live MongoDB check also confirmed that the department summary changed from
+`COLLSCAN` to `IXSCAN` after adding the `joined_on` index. Pylance reported no
+diagnostics for `app/main.py`.
+
+## Things checked and kept
+
+* The unique indexes are intentional: they enforce the employee key and the
+  one-record-per-employee-per-date rule.
+* Analytics start from stored derived fields, as required by the data model.
+  They do not recompute seeded values.
+* The leaderboard uses competition ranking, so ties at the limit are kept.
+* The trend uses `$documents`, `$unionWith`, `$densify`, and a window function
+  because the contract requires database-side gap filling and moving averages.
+* `history` is changed only by regularization. Punch-in and punch-out do not
+  append audit entries.

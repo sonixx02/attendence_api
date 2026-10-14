@@ -15,7 +15,7 @@ much larger and contains cases they do not show.
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env            # set MONGO_URI / MONGO_DB (local docker: docker run -p 27017:27017 mongo:7)
+# create .env with MONGO_URI and MONGO_DB
 python sample_seed.py
 uvicorn app.main:app --port 8000 --reload
 ```

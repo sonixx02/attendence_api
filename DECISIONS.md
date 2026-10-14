@@ -1,25 +1,35 @@
 # DECISIONS.md
 
-I create a unique index on `employees.emp_code` because it enforces the
-business identifier and makes duplicate employee creation race-safe. I create
-a unique compound index on `attendance_logs.(emp_code, date)` for the natural
-attendance key, plus indexes supporting date/employee listing and status/date
-analytics. I considered an index on every individual field, but rejected that
-because it adds write cost without matching a query shape.
+## Indexes
 
-For two simultaneous punch-ins, both requests may initially see no record, but
-only one insert can satisfy the unique `(emp_code, date)` index. That request
-returns 201; the other receives `DuplicateKeyError` and returns 409. No
-check-then-insert decision is trusted.
+I added indexes based on how the API queries the data. The employee code has a unique index, and attendance records have a unique index on `(emp_code, date)` so an employee cannot have multiple attendance records for the same day.
 
-The leaderboard uses MongoDB competition ranking. If two employees tie at rank
-10 and the limit is 10, both rows are returned, because the limit is applied
-to the rank rather than the array position.
+I also added indexes for date and employee lookups, status-based reports, and employee joining dates. The `joined_on` index is useful for the department summary, especially when no department filter is provided.
 
-Department summaries start from employees, filter by `joined_on <= period_end`,
-and then look up logs. Employees with no logs therefore still contribute to
-headcount.
+I avoided adding indexes to every field because they take up storage and add overhead when records are inserted or updated.
 
-At 100x the data, I would move heavy reports to pre-aggregated daily
-collections or scheduled materialized summaries while keeping the API contract
-unchanged.
+## Handling Concurrent Requests
+
+Two punch-in requests for the same employee and date could arrive at almost the same time. Both might check for an existing record before either one is inserted.
+
+Instead of relying only on the initial check, I use the unique attendance index to prevent duplicate records. If one request inserts successfully, the other gets a duplicate-key error, which the API handles by returning a `409 Conflict` response.
+
+For punch-out, the update only succeeds when `punch_out` is still `null`. This prevents two requests from closing the same attendance record independently.
+
+## Leaderboard Ranking
+
+The late-arrival leaderboard uses competition ranking. Employees with the same number of late arrivals receive the same rank.
+
+For example, if two employees share rank 3, the next employee receives rank 5. I apply the requested limit to the rank rather than simply cutting off the list by position, so employees tied at the cutoff are included.
+
+## Department Summary
+
+The department summary starts with employee records instead of attendance logs. This allows employees who have not recorded any attendance to be included in the headcount.
+
+Starting from attendance records would exclude those employees and could produce an incorrect department total.
+
+## Handling Larger Datasets
+
+If the dataset grows to around 100 times its current size, I would consider storing pre-aggregated daily attendance statistics and using them for reporting endpoints.
+
+This would reduce the amount of data processed for repeated reports. I would also check query execution plans and measure response times before deciding which additional indexes or optimizations are necessary. The API responses would remain unchanged so existing clients would continue to work.

@@ -5,11 +5,13 @@ focuses on the contract, atomic MongoDB writes, and aggregation-backed reports.
 """
 import os
 import re
+import json
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Literal, Optional
 
+from bson import json_util
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
@@ -256,6 +258,7 @@ class RegularizeIn(BaseModel):
 async def lifespan(_: FastAPI):
     db.employees.create_index([("emp_code", ASCENDING)], unique=True)
     db.employees.create_index([("department", ASCENDING), ("joined_on", ASCENDING)], name="department_joined")
+    db.employees.create_index([("joined_on", ASCENDING)], name="joined_on")
     db.attendance_logs.create_index([("emp_code", ASCENDING), ("date", ASCENDING)], unique=True)
     db.attendance_logs.create_index([("date", DESCENDING), ("emp_code", ASCENDING)], name="date_employee")
     db.attendance_logs.create_index([("status", ASCENDING), ("date", ASCENDING)], name="status_date")
@@ -410,8 +413,9 @@ def regularize(emp_code: str, date: str, body: RegularizeIn):
             raise HTTPException(422, "invalid punch_out")
     derived = _derived(status, incoming_in, incoming_out, employee, date)
     changed = {}
+    current_defaults = {"late_minutes": 0, "overtime_minutes": 0, "half_day": False}
     for key, new_value in {"status": status, "punch_in": incoming_in, "punch_out": incoming_out, **derived}.items():
-        old_value = current.get(key)
+        old_value = current.get(key, current_defaults.get(key))
         if old_value != new_value:
             changed[key] = {"from": old_value, "to": new_value}
     if not changed:
@@ -420,9 +424,11 @@ def regularize(emp_code: str, date: str, body: RegularizeIn):
     update = {"$set": {"status": status, "punch_in": incoming_in, "punch_out": incoming_out, **derived}, "$push": {"history": history}}
     old_history = current.get("history", [])
     updated = db.attendance_logs.find_one_and_update(
-        {"_id": current["_id"], "$expr": {"$eq": [
-            {"$size": {"$ifNull": ["$history", []]}}, len(old_history)
-        ]}},
+        {"_id": current["_id"], "status": current["status"],
+         "punch_in": current.get("punch_in"), "punch_out": current.get("punch_out"),
+         "$expr": {"$eq": [
+             {"$size": {"$ifNull": ["$history", []]}}, len(old_history)
+         ]}},
         update,
         return_document=ReturnDocument.AFTER,
     )
@@ -636,7 +642,9 @@ def _trend_pipeline(department: str, from_date: str, to_date: str) -> list[dict[
         {"$lookup": {"from": "employees", "let": {"day": "$date"}, "pipeline": [
             {"$match": {"$expr": {"$and": [
                 {"$eq": ["$department", department]},
-                {"$lte": ["$joined_on", {"$dateToString": {"date": "$$day"}}]},
+                {"$lte": ["$joined_on", {"$dateToString": {
+                    "date": "$$day", "format": "%Y-%m-%d"
+                }}]},
             ]}}},
             {"$count": "count"},
         ], "as": "headcount_docs"}},
@@ -711,7 +719,8 @@ def explain(endpoint: str, emp_code: Optional[str] = None, month: Optional[str] 
         explain_doc = db.command("explain", {"find": "attendance_logs", "filter": query,
                                              "sort": {"date": -1, "emp_code": 1},
                                              "skip": (page - 1) * page_size, "limit": page_size}, verbosity="executionStats")
-        return {"endpoint": endpoint, "collection": "attendance_logs", "explain": explain_doc}
+        return {"endpoint": endpoint, "collection": "attendance_logs",
+                "explain": json.loads(json_util.dumps(explain_doc))}
     if endpoint in {"employee_monthly", "department_summary", "late_leaderboard"} and not month:
         raise HTTPException(422, "month is required")
     if endpoint == "employee_monthly" and not emp_code:
@@ -737,6 +746,21 @@ def explain(endpoint: str, emp_code: Optional[str] = None, month: Optional[str] 
         if (end - start).days + 1 > 92:
             raise HTTPException(422, "range cannot exceed 92 days")
         pipeline = _trend_pipeline(department, from_date, to_date)
-        collection = 1
-    explain_doc = db.command("explain", {"aggregate": collection, "pipeline": pipeline, "cursor": {}}, verbosity="executionStats")
-    return {"endpoint": endpoint, "collection": collection, "explain": explain_doc}
+        # The first stage is $documents, so this collection is only the
+        # required namespace for the aggregate command.
+        collection = "1"
+    if endpoint == "department_trend":
+        # MongoDB requires aggregate: 1 for a pipeline beginning with
+        # $documents; the aggregate command's explain flag is the supported
+        # form for this special namespace.
+        explain_doc = db.command(
+            "aggregate", 1, pipeline=pipeline, cursor={}, explain=True
+        )
+    else:
+        explain_doc = db.command(
+            "explain",
+            {"aggregate": collection, "pipeline": pipeline, "cursor": {}},
+            verbosity="executionStats",
+        )
+    return {"endpoint": endpoint, "collection": collection,
+            "explain": json.loads(json_util.dumps(explain_doc))}
